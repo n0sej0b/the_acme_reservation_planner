@@ -1,94 +1,213 @@
 const pg = require('pg');
-const client = new pg.Client(process.env.DATABASE_URL || 'postgres://localhost/acme_reservation_db');
-const uuid = require('uuid');
+const { v4: uuidv4 } = require('uuid'); 
 
 
-const createTables = async() => {
-   const SQL = `
-   drop table if exists reservations;
-   drop table if exists restaurants;
-   drop table if exists customers;
-   create table customers(
-        id UUID PRIMARY KEY,
-        name varchar(55) not null unique
-        );
-    create table restaurants(
-    id UUID PRIMARY KEY,
-    name varchar(55) not null unique
-    );
+const pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL || 'postgres://localhost/acme_reservation_db',
+    max: 20,  
+});
 
-    create table reservations(
-        id UUID PRIMARY KEY,
-        date date not null,
-        party_count integer not null,
-        restaurant_id UUID references restaurants(id) not null,
-        customer_id UUID references customers(id) not null
-        );
-     `;
-    await client.query(SQL);
+
+const executeQuery = async (query, params = []) => {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(query, params);
+        return result.rows;
+    } catch (error) {
+        console.error('Database query error:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
 };
 
-const createCustomer = async ({name}) => {
+const createTables = async () => {
     const SQL = `
-        insert into customers(id, name) values($1, $2) returning *
+        DROP TABLE IF EXISTS reservations;
+        DROP TABLE IF EXISTS restaurants;
+        DROP TABLE IF EXISTS customers;
+
+        CREATE TABLE customers (
+            id UUID PRIMARY KEY,
+            name VARCHAR(55) NOT NULL UNIQUE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE restaurants (
+            id UUID PRIMARY KEY,
+            name VARCHAR(55) NOT NULL UNIQUE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE reservations (
+            id UUID PRIMARY KEY,
+            date DATE NOT NULL,
+            party_count INTEGER NOT NULL CHECK (party_count > 0),
+            restaurant_id UUID REFERENCES restaurants(id) NOT NULL,
+            customer_id UUID REFERENCES customers(id) NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX idx_reservations_date ON reservations(date);
+        CREATE INDEX idx_reservations_customer ON reservations(customer_id);
+        CREATE INDEX idx_reservations_restaurant ON reservations(restaurant_id);
     `;
-    const response = await client.query(SQL, [uuid.v4(), name]);
-    return response.rows[0];
-}
+    
+    try {
+        await executeQuery(SQL);
+    } catch (error) {
+        console.error('Error creating tables:', error);
+        throw error;
+    }
+};
 
+const createCustomer = async ({ name }) => {
+    if (!name || typeof name !== 'string') {
+        throw new Error('Valid customer name is required');
+    }
 
-const createRestaurant = async ({name}) => {
     const SQL = `
-        insert into restaurants(id, name) values($1, $2) returning *
+        INSERT INTO customers(id, name) 
+        VALUES($1, $2) 
+        RETURNING *
     `;
-    const response = await client.query(SQL, [uuid.v4(), name]);
-    return response.rows[0];
-}
+    
+    try {
+        const [customer] = await executeQuery(SQL, [uuidv4(), name.trim()]);
+        return customer;
+    } catch (error) {
+        if (error.code === '23505') { // unique violation
+            throw new Error(`Customer with name ${name} already exists`);
+        }
+        throw error;
+    }
+};
+
+const createRestaurant = async ({ name }) => {
+    if (!name || typeof name !== 'string') {
+        throw new Error('Valid restaurant name is required');
+    }
+
+    const SQL = `
+        INSERT INTO restaurants(id, name) 
+        VALUES($1, $2) 
+        RETURNING *
+    `;
+    
+    try {
+        const [restaurant] = await executeQuery(SQL, [uuidv4(), name.trim()]);
+        return restaurant;
+    } catch (error) {
+        if (error.code === '23505') {
+            throw new Error(`Restaurant with name ${name} already exists`);
+        }
+        throw error;
+    }
+};
 
 const fetchCustomers = async () => {
-    const SQL =`
-    select * from customers
+    const SQL = `
+        SELECT * FROM customers 
+        ORDER BY name
     `;
-    const response = await client.query(SQL);
-    return response.rows;
+    return await executeQuery(SQL);
 };
 
-
 const fetchRestaurants = async () => {
-    const SQL =`
-    select * from restaurants
+    const SQL = `
+        SELECT * FROM restaurants 
+        ORDER BY name
     `;
-    const response = await client.query(SQL);
-    return response.rows;
+    return await executeQuery(SQL);
 };
 
 const createReservations = async ({ name, restaurant_name, party_count, date }) => {
+    if (!name || !restaurant_name || !party_count || !date) {
+        throw new Error('All fields are required for reservation');
+    }
+
+    if (party_count <= 0) {
+        throw new Error('Party count must be greater than 0');
+    }
+
     const SQL = `
-    insert into reservations(id, customer_id, restaurant_id, party_count, date) values($1, (select id from customers where name = $2), (select id from restaurants where name = $3), $4, $5) returning *
+        INSERT INTO reservations(id, customer_id, restaurant_id, party_count, date) 
+        VALUES(
+            $1, 
+            (SELECT id FROM customers WHERE name = $2), 
+            (SELECT id FROM restaurants WHERE name = $3), 
+            $4, 
+            $5
+        ) 
+        RETURNING *
     `;
-    const response = await client.query(SQL, [uuid.v4(), name, restaurant_name, party_count, date]);
-    return response.rows[0];
+    
+    try {
+        const [reservation] = await executeQuery(SQL, [
+            uuidv4(), 
+            name, 
+            restaurant_name, 
+            party_count, 
+            date
+        ]);
+        return reservation;
+    } catch (error) {
+        if (error.code === '23503') { 
+            throw new Error('Customer or restaurant not found');
+        }
+        throw error;
+    }
 };
 
 const fetchReservations = async () => {
     const SQL = `
-    select id, date, party_count, restaurant_id, customer_id from reservations
-  `;
-  const response = await client.query(SQL);
-  return response.rows;
+        SELECT 
+            r.id,
+            r.date,
+            r.party_count,
+            c.name as customer_name,
+            rest.name as restaurant_name
+        FROM reservations r
+        JOIN customers c ON r.customer_id = c.id
+        JOIN restaurants rest ON r.restaurant_id = rest.id
+        ORDER BY r.date DESC
+    `;
+    return await executeQuery(SQL);
 };
 
-const destroyReservations = async ({ id, customer_id}) => {
-    console.log(id, customer_id)
+const destroyReservations = async ({ id, customer_id }) => {
+    if (!id || !customer_id) {
+        throw new Error('Reservation ID and customer ID are required');
+    }
+
     const SQL = `
-        delete from reservations
-        where id=$1 and customer_id=$2
+        DELETE FROM reservations
+        WHERE id = $1 AND customer_id = $2
+        RETURNING *
     `;
-    await client.query(SQL, [id, customer_id]);
+    
+    const [deleted] = await executeQuery(SQL, [id, customer_id]);
+    if (!deleted) {
+        throw new Error('Reservation not found or unauthorized');
+    }
+    return deleted;
 };
+
+// Cleanup function for graceful shutdown
+const cleanup = async () => {
+    try {
+        await pool.end();
+    } catch (error) {
+        console.error('Error during cleanup:', error);
+    }
+};
+
+// Handle process termination
+process.on('SIGINT', cleanup);
+process.on('SIGTERM', cleanup);
 
 module.exports = {
-    client,
+    pool,
     createTables,
     createCustomer,
     createRestaurant,
@@ -98,3 +217,4 @@ module.exports = {
     createReservations,
     destroyReservations
 };
+// Finished
